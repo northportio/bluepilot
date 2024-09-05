@@ -171,6 +171,8 @@ class CarState(CarStateBase):
     if CP.flags & FordFlags.CANFD:
       messages += [
         ("Lane_Assist_Data3_FD1", 33),
+        ("Cluster_Info_3_FD1", 10),
+        ("IPMA_Data2", 1),
       ]
     else:
       messages += [
