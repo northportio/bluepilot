@@ -1,359 +1,225 @@
 from cereal import car
-from openpilot.common.numpy_fast import clip
-from openpilot.selfdrive.car import CanBusBase
+from opendbc.can.can_define import CANDefine
+from opendbc.can.parser import CANParser
+from openpilot.common.conversions import Conversions as CV
+from openpilot.selfdrive.car.ford.fordcan import CanBus
+from openpilot.selfdrive.car.ford.values import DBC, CarControllerParams, FordFlags, FordConfig, BUTTONS
+from openpilot.selfdrive.car.interfaces import CarStateBase
 
-HUDControl = car.CarControl.HUDControl
-
-
-class CanBus(CanBusBase):
-  def __init__(self, CP=None, fingerprint=None) -> None:
-    super().__init__(CP, fingerprint)
-
-  @property
-  def main(self) -> int:
-    return self.offset
-
-  @property
-  def radar(self) -> int:
-    return self.offset + 1
-
-  @property
-  def camera(self) -> int:
-    return self.offset + 2
+GearShifter = car.CarState.GearShifter
+TransmissionType = car.CarParams.TransmissionType
 
 
-def calculate_lat_ctl2_checksum(mode: int, counter: int, dat: bytearray) -> int:
-  curvature = (dat[2] << 3) | ((dat[3]) >> 5)
-  curvature_rate = (dat[6] << 3) | ((dat[7]) >> 5)
-  path_angle = ((dat[3] & 0x1F) << 6) | ((dat[4]) >> 2)
-  path_offset = ((dat[4] & 0x3) << 8) | dat[5]
+class CarState(CarStateBase):
+  def __init__(self, CP):
+    super().__init__(CP)
+    can_define = CANDefine(DBC[CP.carFingerprint]["pt"])
 
-  checksum = mode + counter
-  for sig_val in (curvature, curvature_rate, path_angle, path_offset):
-    checksum += sig_val + (sig_val >> 8)
+    self.bluecruise_cluster_present = FordConfig.BLUECRUISE_CLUSTER_PRESENT # Sets the value of whether the car has the blue cruise cluster
+    if CP.transmissionType == TransmissionType.automatic:
+      if CP.flags & FordFlags.CANFD:
+        self.shifter_values = can_define.dv["Gear_Shift_by_Wire_FD1"]["TrnRng_D_RqGsm"]
+      else:
+        self.shifter_values = can_define.dv["PowertrainData_10"]["TrnRng_D_Rq"]
 
-  return 0xFF - (checksum & 0xFF)
+    self.vehicle_sensors_valid = False
 
+    self.prev_distance_button = 0
+    self.distance_button = 0
 
-def create_lka_msg(packer, CAN: CanBus):
-  """
-  Creates an empty CAN message for the Ford LKA Command.
+    self.lkas_enabled = None
+    self.prev_lkas_enabled = None
+    self.v_limit = 0
 
-  This command can apply "Lane Keeping Aid" manoeuvres, which are subject to the PSCM lockout.
+    self.button_states = {button.event_type: False for button in BUTTONS}
 
-  Frequency is 33Hz.
-  """
+  def update(self, cp, cp_cam):
+    ret = car.CarState.new_message()
 
-  return packer.make_can_msg("Lane_Assist_Data1", CAN.main, {})
+    self.prev_mads_enabled = self.mads_enabled
+    self.prev_lkas_enabled = self.lkas_enabled
 
-def create_lka3_msg(packer, CAN: CanBus):
-  """
-  Creates an empty CAN message for the Ford LKA Command.
+    # Occasionally on startup, the ABS module recalibrates the steering pinion offset, so we need to block engagement
+    # The vehicle usually recovers out of this state within a minute of normal driving
+    self.vehicle_sensors_valid = cp.vl["SteeringPinion_Data"]["StePinCompAnEst_D_Qf"] == 3
 
-  This command can apply "Lane Keeping Aid" manoeuvres, which are subject to the PSCM lockout.
+    # car speed
+    ret.vEgoRaw = cp.vl["BrakeSysFeatures"]["Veh_V_ActlBrk"] * CV.KPH_TO_MS
+    ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
+    if self.CP.flags & FordFlags.CANFD:
+      ret.vEgoCluster = ((cp.vl["Cluster_Info_3_FD1"]["DISPLAY_SPEED_SCALING"]/100) * cp.vl["EngVehicleSpThrottle2"]["Veh_V_ActlEng"] +
+                         cp.vl["Cluster_Info_3_FD1"]["DISPLAY_SPEED_OFFSET"]) * CV.KPH_TO_MS
 
-  Frequency is 33Hz.
-  """
-  values = {
-    "LatCtlCpblty_D_Stat": 2,                   # Lateral Control Capability: 0=NoModeAvailable, 1=LimitedModeAvailable,
-                                                #            2=ExtendedModeAvailable, 3=Faulty [0|3]
-    "LaActAvail_D_Actl": 3,                      # Lane Keeping Aid Availability: 0=No, 1=Yes, 2=Faulty, 3=NotAvailable [0|3]
-  }
-  return packer.make_can_msg("Lane_Assist_Data3", CAN.main, values)
+    ret.yawRate = cp.vl["Yaw_Data_FD1"]["VehYaw_W_Actl"]
+    ret.standstill = cp.vl["DesiredTorqBrk"]["VehStop_D_Stat"] == 1
 
+    # gas pedal
+    ret.gas = cp.vl["EngVehicleSpThrottle"]["ApedPos_Pc_ActlArb"] / 100.
+    ret.gasPressed = ret.gas > 1e-6
 
-def create_lat_ctl_msg(packer, CAN: CanBus, lat_active: bool, ramp_type: int, precision_type: int, path_offset: float, path_angle: float,
-                       curvature: float, curvature_rate: float):
-  """
-  Creates a CAN message for the Ford TJA/LCA Command.
+    # brake pedal
+    ret.brake = cp.vl["BrakeSnData_4"]["BrkTot_Tq_Actl"] / 32756.  # torque in Nm
+    ret.brakePressed = cp.vl["EngBrakeData"]["BpedDrvAppl_D_Actl"] == 2
+    ret.parkingBrake = cp.vl["DesiredTorqBrk"]["PrkBrkStatus"] in (1, 2)
 
-  This command can apply "Lane Centering" manoeuvres: continuous lane centering for traffic jam assist and highway
-  driving. It is not subject to the PSCM lockout.
+    # steering wheel
+    ret.steeringAngleDeg = cp.vl["SteeringPinion_Data"]["StePinComp_An_Est"]
+    ret.steeringTorque = cp.vl["EPAS_INFO"]["SteeringColumnTorque"]
+    ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > CarControllerParams.STEER_DRIVER_ALLOWANCE, 5)
+    ret.steerFaultTemporary = cp.vl["EPAS_INFO"]["EPAS_Failure"] == 1
+    ret.steerFaultPermanent = cp.vl["EPAS_INFO"]["EPAS_Failure"] in (2, 3)
+    ret.espDisabled = cp.vl["Cluster_Info1_FD1"]["DrvSlipCtlMde_D_Rq"] != 0  # 0 is default mode
 
-  Ford lane centering command uses a third order polynomial to describe the road centerline. The polynomial is defined
-  by the following coefficients:
-    c0: lateral offset between the vehicle and the centerline (positive is right)
-    c1: heading angle between the vehicle and the centerline (positive is right)
-    c2: curvature of the centerline (positive is left)
-    c3: rate of change of curvature of the centerline
-  As the PSCM combines this information with other sensor data, such as the vehicle's yaw rate and speed, the steering
-  angle cannot be easily controlled.
+    if self.CP.flags & FordFlags.CANFD:
+      # this signal is always 0 on non-CAN FD cars
+      ret.steerFaultTemporary |= cp.vl["Lane_Assist_Data3_FD1"]["LatCtlSte_D_Stat"] not in (1, 2, 3)
 
-  The PSCM should be configured to accept TJA/LCA commands before these commands will be processed. This can be done
-  using tools such as Forscan.
+    # cruise state
+    is_metric = cp.vl["INSTRUMENT_PANEL"]["METRIC_UNITS"] == 1 if not self.CP.flags & FordFlags.CANFD else cp.vl["IPMA_Data2"]["IsaVLimUnit_D_Rq"] == 1
+    ret.cruiseState.speed = cp.vl["EngBrakeData"]["Veh_V_DsplyCcSet"] * (CV.KPH_TO_MS if is_metric else CV.MPH_TO_MS)
+    ret.cruiseState.enabled = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (4, 5)
+    ret.cruiseState.available = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (3, 4, 5)
+    ret.cruiseState.nonAdaptive = cp.vl["Cluster_Info1_FD1"]["AccEnbl_B_RqDrv"] == 0
+    ret.cruiseState.standstill = cp.vl["EngBrakeData"]["AccStopMde_D_Rq"] == 3
+    ret.accFaulted = cp.vl["EngBrakeData"]["CcStat_D_Actl"] in (1, 2)
 
-  Frequency is 20Hz.
-  """
+    if self.CP.flags & FordFlags.CANFD:
+      ret.cruiseState.speedLimit = self.update_traffic_signals(cp_cam)
 
-  values = {
-    "LatCtlRng_L_Max": 0,                       # Unknown [0|126] meter
-    "HandsOffCnfm_B_Rq": 0,                     # Unknown: 0=Inactive, 1=Active [0|1]
-    "LatCtl_D_Rq": 1 if lat_active else 0,      # Mode: 0=None, 1=ContinuousPathFollowing, 2=InterventionLeft,
-                                                #       3=InterventionRight, 4-7=NotUsed [0|7]
-    "LatCtlRampType_D_Rq": ramp_type,           # Ramp speed: 0=Slow, 1=Medium, 2=Fast, 3=Immediate [0|3]
-                                                #             Makes no difference with curvature control
-    "LatCtlPrecision_D_Rq": precision_type,     # Precision: 0=Comfortable, 1=Precise, 2/3=NotUsed [0|3]
-                                                #            The stock system always uses comfortable
-    "LatCtlPathOffst_L_Actl": path_offset,      # Path offset [-5.12|5.11] meter
-    "LatCtlPath_An_Actl": path_angle,           # Path angle [-0.5|0.5235] radians
-    "LatCtlCurv_NoRate_Actl": curvature_rate,   # Curvature rate [-0.001024|0.00102375] 1/meter^2
-    "LatCtlCurv_No_Actl": curvature,            # Curvature [-0.02|0.02094] 1/meter
-  }
-  return packer.make_can_msg("LateralMotionControl", CAN.main, values)
+    if not self.CP.openpilotLongitudinalControl:
+      ret.accFaulted = ret.accFaulted or cp_cam.vl["ACCDATA"]["CmbbDeny_B_Actl"] == 1
 
+    # gear
+    if self.CP.transmissionType == TransmissionType.automatic:
+      gear = self.shifter_values.get(cp.vl["Gear_Shift_by_Wire_FD1"]["TrnRng_D_RqGsm"])
+      ret.gearShifter = self.parse_gear_shifter(gear)
+    elif self.CP.transmissionType == TransmissionType.manual:
+      ret.clutchPressed = cp.vl["Engine_Clutch_Data"]["CluPdlPos_Pc_Meas"] > 0
+      if bool(cp.vl["BCM_Lamp_Stat_FD1"]["RvrseLghtOn_B_Stat"]):
+        ret.gearShifter = GearShifter.reverse
+      else:
+        ret.gearShifter = GearShifter.drive
 
-def create_lat_ctl2_msg(packer, CAN: CanBus, mode: int, ramp_type: int, precision_type: int, path_offset: float, path_angle: float, curvature: float,
-                        curvature_rate: float, counter: int):
+    # Buttons
+    for button in BUTTONS:
+      state = (cp.vl[button.can_addr][button.can_msg] in button.values)
+      if self.button_states[button.event_type] != state:
+        event = car.CarState.ButtonEvent.new_message()
+        event.type = button.event_type
+        event.pressed = state
+        self.button_events.append(event)
+      self.button_states[button.event_type] = state
 
-  """
-  Create a CAN message for the new Ford Lane Centering command.
+    # safety
+    ret.stockFcw = bool(cp_cam.vl["ACCDATA_3"]["FcwVisblWarn_B_Rq"])
+    ret.stockAeb = bool(cp_cam.vl["ACCDATA_2"]["CmbbBrkDecel_B_Rq"])
 
-  This message is used on the CAN FD platform and replaces the old LateralMotionControl message. It is similar but has
-  additional signals for a counter and checksum.
+    # button presses
+    ret.leftBlinker = ret.leftBlinkerOn = cp.vl["Steering_Data_FD1"]["TurnLghtSwtch_D_Stat"] == 1
+    ret.rightBlinker = ret.rightBlinkerOn = cp.vl["Steering_Data_FD1"]["TurnLghtSwtch_D_Stat"] == 2
+    # TODO: block this going to the camera otherwise it will enable stock TJA
+    ret.genericToggle = bool(cp.vl["Steering_Data_FD1"]["TjaButtnOnOffPress"])
+    self.prev_distance_button = self.distance_button
+    self.distance_button = cp.vl["Steering_Data_FD1"]["AccButtnGapTogglePress"]
 
-  Frequency is 20Hz.
-  """
+    # lock info
+    ret.doorOpen = any([cp.vl["BodyInfo_3_FD1"]["DrStatDrv_B_Actl"], cp.vl["BodyInfo_3_FD1"]["DrStatPsngr_B_Actl"],
+                        cp.vl["BodyInfo_3_FD1"]["DrStatRl_B_Actl"], cp.vl["BodyInfo_3_FD1"]["DrStatRr_B_Actl"]])
+    ret.seatbeltUnlatched = cp.vl["RCMStatusMessage2_FD1"]["FirstRowBuckleDriver"] == 2
 
-  values = {
-    "LatCtl_D2_Rq": mode,                       # Mode: 0=None, 1=PathFollowingLimitedMode, 2=PathFollowingExtendedMode,
-                                                #       3=SafeRampOut, 4-7=NotUsed [0|7]
-    "LatCtlRampType_D_Rq": ramp_type,           # 0=Slow, 1=Medium, 2=Fast, 3=Immediate [0|3]
-    "LatCtlPrecision_D_Rq": precision_type,     # 0=Comfortable, 1=Precise, 2/3=NotUsed [0|3]
-    "LatCtlPathOffst_L_Actl": path_offset,      # [-5.12|5.11] meter
-    "LatCtlPath_An_Actl": path_angle,           # [-0.5|0.5235] radians
-    "LatCtlCurv_No_Actl": curvature,            # [-0.02|0.02094] 1/meter
-    "LatCtlCrv_NoRate2_Actl": curvature_rate,   # [-0.001024|0.001023] 1/meter^2
-    "HandsOffCnfm_B_Rq": 0,                     # 0=Inactive, 1=Active [0|1]
-    "LatCtlPath_No_Cnt": counter,               # [0|15]
-    "LatCtlPath_No_Cs": 0,                      # [0|255]
-  }
+    # blindspot sensors
+    if self.CP.enableBsm:
+      cp_bsm = cp_cam if self.CP.flags & FordFlags.CANFD else cp
+      ret.leftBlindspot = cp_bsm.vl["Side_Detect_L_Stat"]["SodDetctLeft_D_Stat"] != 0
+      ret.rightBlindspot = cp_bsm.vl["Side_Detect_R_Stat"]["SodDetctRight_D_Stat"] != 0
 
-  # calculate checksum
-  dat = packer.make_can_msg("LateralMotionControl2", 0, values)[2]
-  values["LatCtlPath_No_Cs"] = calculate_lat_ctl2_checksum(mode, counter, dat)
+    self.lkas_enabled = bool(cp.vl["Steering_Data_FD1"]["TjaButtnOnOffPress"])
 
-  return packer.make_can_msg("LateralMotionControl2", CAN.main, values)
+    # Stock steering buttons so that we can passthru blinkers etc.
+    self.buttons_stock_values = cp.vl["Steering_Data_FD1"]
+    # Stock values from IPMA so that we can retain some stock functionality
+    self.acc_tja_status_stock_values = cp_cam.vl["ACCDATA_3"]
+    self.lkas_status_stock_values = cp_cam.vl["IPMA_Data"]
 
+    return ret
 
-def create_acc_msg(packer, CAN: CanBus, long_active: bool, gas: float, accel: float, stopping: bool, brake_actuator: bool, precharge_actuator: bool, v_ego_kph: float):
-  """
-  Creates a CAN message for the Ford ACC Command.
+  def update_traffic_signals(self, cp_cam):
+    # TODO: Check if CAN platforms have the same signals
+    if self.CP.flags & FordFlags.CANFD:
+      self.v_limit = cp_cam.vl["Traffic_RecognitnData"]["TsrVLim1MsgTxt_D_Rq"]
+      v_limit_unit = cp_cam.vl["Traffic_RecognitnData"]["TsrVlUnitMsgTxt_D_Rq"]
 
-  This command can be used to enable ACC, to set the ACC gas/brake/decel values
-  and to disable ACC.
+      speed_factor = CV.MPH_TO_MS if v_limit_unit == 2 else CV.KPH_TO_MS if v_limit_unit == 1 else 0
 
-  Frequency is 50Hz.
-  """
-  # decel = accel < 0 and long_active
-  values = {
-    "AccBrkTot_A_Rq": accel,                          # Brake total accel request: [-20|11.9449] m/s^2
-    "Cmbb_B_Enbl": 1 if long_active else 0,           # Enabled: 0=No, 1=Yes
-    "AccPrpl_A_Rq": gas,                              # Acceleration request: [-5|5.23] m/s^2
-    "AccPrpl_A_Pred": -5.0,                           # Acceleration request: [-5|5.23] m/s^2
-    "AccResumEnbl_B_Rq": 1 if long_active else 0,
-    "AccVeh_V_Trg": v_ego_kph,                        # Target speed: [0|255] km/h
-    # TODO: we may be able to improve braking response by utilizing pre-charging better
-    "AccBrkPrchg_B_Rq": 1 if precharge_actuator else 0,            # Pre-charge brake request: 0=No, 1=Yes
-    "AccBrkDecel_B_Rq": 1 if brake_actuator else 0,            # Deceleration request: 0=Inactive, 1=Active
-    "AccStopStat_B_Rq": 1 if stopping else 0,
-  }
-  return packer.make_can_msg("ACCDATA", CAN.main, values)
+      return self.v_limit * speed_factor if self.v_limit not in (0, 255) else 0
 
+  @staticmethod
+  def get_can_parser(CP):
+    messages = [
+      # sig_address, frequency
+      ("VehicleOperatingModes", 100),
+      ("BrakeSysFeatures", 50),
+      ("Yaw_Data_FD1", 100),
+      ("DesiredTorqBrk", 50),
+      ("EngVehicleSpThrottle", 100),
+      ("BrakeSnData_4", 50),
+      ("EngBrakeData", 10),
+      ("Cluster_Info1_FD1", 10),
+      ("SteeringPinion_Data", 100),
+      ("EPAS_INFO", 50),
+      ("Steering_Data_FD1", 10),
+      ("BodyInfo_3_FD1", 2),
+      ("RCMStatusMessage2_FD1", 10),
+    ]
 
-def create_acc_ui_msg(packer, CAN: CanBus, CP, main_on: bool, enabled: bool, fcw_alert: bool, standstill: bool,
-                      hud_control, stock_values: dict, bc_cluster: bool):
-  """
-  Creates a CAN message for the Ford IPC adaptive cruise, forward collision warning and traffic jam
-  assist status.
-
-  Stock functionality is maintained by passing through unmodified signals.
-
-  Frequency is 5Hz.
-  """
-
-   # Tja_D_Stat
-  if enabled:
-    if hud_control.leftLaneDepart:
-      status = 3  # ActiveInterventionLeft
-    elif hud_control.rightLaneDepart:
-      status = 4  # ActiveInterventionRight
-    elif bc_cluster:
-      status = 7 # Show BlueCruise UI in the Cluster
+    if CP.flags & FordFlags.CANFD:
+      messages += [
+        ("Lane_Assist_Data3_FD1", 33),
+        ("Cluster_Info_3_FD1", 10),
+        ("IPMA_Data2", 1),
+      ]
     else:
-      status = 2  # Active
-  elif main_on:
-    if hud_control.leftLaneDepart:
-      status = 5  # ActiveWarningLeft
-    elif hud_control.rightLaneDepart:
-      status = 6  # ActiveWarningRight
-    else:
-      status = 1  # Standby
-  else:
-    status = 0    # Off
+      messages += [
+        ("INSTRUMENT_PANEL", 1),
+      ]
 
-  values = {s: stock_values[s] for s in [
-    "HaDsply_No_Cs",
-    "HaDsply_No_Cnt",
-    "AccStopStat_D_Dsply",       # ACC stopped status message
-    "AccTrgDist2_D_Dsply",       # ACC target distance
-    "AccStopRes_B_Dsply",
-    "TjaWarn_D_Rq",              # TJA warning
-    "TjaMsgTxt_D_Dsply",         # TJA text
-    "IaccLamp_D_Rq",             # iACC status icon
-    "AccMsgTxt_D2_Rq",           # ACC text
-    "FcwDeny_B_Dsply",           # FCW disabled
-    "FcwMemStat_B_Actl",         # FCW enabled setting
-    "AccTGap_B_Dsply",           # ACC time gap display setting
-    "CadsAlignIncplt_B_Actl",
-    "AccFllwMde_B_Dsply",        # ACC follow mode display setting
-    "CadsRadrBlck_B_Actl",
-    "CmbbPostEvnt_B_Dsply",      # AEB event status
-    "AccStopMde_B_Dsply",        # ACC stop mode display setting
-    "FcwMemSens_D_Actl",         # FCW sensitivity setting
-    "FcwMsgTxt_D_Rq",            # FCW text
-    "AccWarn_D_Dsply",           # ACC warning
-    "FcwVisblWarn_B_Rq",         # FCW visible alert
-    "FcwAudioWarn_B_Rq",         # FCW audio alert
-    "AccTGap_D_Dsply",           # ACC time gap
-    "AccMemEnbl_B_RqDrv",        # ACC adaptive/normal setting
-    "FdaMem_B_Stat",             # FDA enabled setting
-  ]}
+    if CP.transmissionType == TransmissionType.automatic:
+      messages += [
+        ("Gear_Shift_by_Wire_FD1", 10),
+      ]
+    elif CP.transmissionType == TransmissionType.manual:
+      messages += [
+        ("Engine_Clutch_Data", 33),
+        ("BCM_Lamp_Stat_FD1", 1),
+      ]
 
-  values.update({
-    "Tja_D_Stat": status,        # TJA status
-  })
+    if CP.enableBsm and not (CP.flags & FordFlags.CANFD):
+      messages += [
+        ("Side_Detect_L_Stat", 5),
+        ("Side_Detect_R_Stat", 5),
+      ]
 
-  if CP.openpilotLongitudinalControl:
-    values.update({
-      "AccStopStat_D_Dsply": 2 if standstill else 0,              # Stopping status text
-      "AccMsgTxt_D2_Rq": 0,                                       # ACC text
-      "AccTGap_B_Dsply": 0,                                       # Show time gap control UI
-      "AccFllwMde_B_Dsply": 1 if hud_control.leadVisible else 0,  # Lead indicator
-      "AccStopMde_B_Dsply": 1 if standstill else 0,
-      "AccWarn_D_Dsply": 0,                                       # ACC warning
-      "AccTGap_D_Dsply": hud_control.leadDistanceBars,            # Time gap
-    })
+    return CANParser(DBC[CP.carFingerprint]["pt"], messages, CanBus(CP).main)
 
-  # Forwards FCW alert from IPMA
-  if fcw_alert:
-    values["FcwVisblWarn_B_Rq"] = 1  # FCW visible alert
+  @staticmethod
+  def get_cam_can_parser(CP):
+    messages = [
+      # sig_address, frequency
+      ("ACCDATA", 50),
+      ("ACCDATA_2", 50),
+      ("ACCDATA_3", 5),
+      ("IPMA_Data", 1),
+    ]
 
-  return packer.make_can_msg("ACCDATA_3", CAN.main, values)
+    if CP.flags & FordFlags.CANFD:
+      messages += [
+        ("Traffic_RecognitnData", 1),
+      ]
 
+    if CP.enableBsm and CP.flags & FordFlags.CANFD:
+      messages += [
+        ("Side_Detect_L_Stat", 5),
+        ("Side_Detect_R_Stat", 5),
+      ]
 
-def create_lkas_ui_msg(packer, CAN: CanBus, main_on: bool, enabled: bool, steer_alert: bool, hud_control,
-                       stock_values: dict):
-  """
-  Creates a CAN message for the Ford IPC IPMA/LKAS status.
-
-  Show the LKAS status with the "driver assist" lines in the IPC.
-
-  Stock functionality is maintained by passing through unmodified signals.
-
-  Frequency is 1Hz.
-  """
-
-  # LaActvStats_D_Dsply
-  #    R  Intvn Warn Supprs Avail No
-  # L
-  # Intvn  24    19    14     9   4
-  # Warn   23    18    13     8   3
-  # Supprs 22    17    12     7   2
-  # Avail  21    16    11     6   1
-  # No     20    15    10     5   0
-  #
-  # TODO: test suppress state
-  if enabled:
-    lines = 0  # NoLeft_NoRight
-    if hud_control.leftLaneDepart:
-      lines += 4
-    elif hud_control.leftLaneVisible:
-      lines += 1
-    if hud_control.rightLaneDepart:
-      lines += 20
-    elif hud_control.rightLaneVisible:
-      lines += 5
-  elif main_on:
-    lines = 0
-  else:
-    if hud_control.leftLaneDepart:
-      lines = 3  # WarnLeft_NoRight
-    elif hud_control.rightLaneDepart:
-      lines = 15  # NoLeft_WarnRight
-    else:
-      lines = 30  # LA_Off
-
-  hands_on_wheel_dsply = 1 if steer_alert else 0
-
-  values = {s: stock_values[s] for s in [
-    "FeatConfigIpmaActl",
-    "FeatNoIpmaActl",
-    "PersIndexIpma_D_Actl",
-    "AhbcRampingV_D_Rq",     # AHB ramping
-    "LaDenyStats_B_Dsply",   # LKAS error
-    "CamraDefog_B_Req",      # Windshield heater?
-    "CamraStats_D_Dsply",    # Camera status
-    "DasAlrtLvl_D_Dsply",    # DAS alert level
-    "DasStats_D_Dsply",      # DAS status
-    "DasWarn_D_Dsply",       # DAS warning
-    "AhbHiBeam_D_Rq",        # AHB status
-    "Passthru_63",
-    "Passthru_48",
-  ]}
-
-  values.update({
-    "LaActvStats_D_Dsply": lines,                 # LKAS status (lines) [0|31]
-    "LaHandsOff_D_Dsply": hands_on_wheel_dsply,   # 0=HandsOn, 1=Level1 (w/o chime), 2=Level2 (w/ chime), 3=Suppressed
-  })
-  return packer.make_can_msg("IPMA_Data", CAN.main, values)
-
-
-def create_button_msg(packer, bus: int, stock_values: dict, cancel=False, resume=False, tja_toggle=False):
-  """
-  Creates a CAN message for the Ford SCCM buttons/switches.
-
-  Includes cruise control buttons, turn lights and more.
-
-  Frequency is 10Hz.
-  """
-
-  values = {s: stock_values[s] for s in [
-    "HeadLghtHiFlash_D_Stat",  # SCCM Passthrough the remaining buttons
-    "TurnLghtSwtch_D_Stat",    # SCCM Turn signal switch
-    "WiprFront_D_Stat",
-    "LghtAmb_D_Sns",
-    "AccButtnGapDecPress",
-    "AccButtnGapIncPress",
-    "AslButtnOnOffCnclPress",
-    "AslButtnOnOffPress",
-    "LaSwtchPos_D_Stat",
-    "CcAslButtnCnclResPress",
-    "CcAslButtnDeny_B_Actl",
-    "CcAslButtnIndxDecPress",
-    "CcAslButtnIndxIncPress",
-    "CcAslButtnOffCnclPress",
-    "CcAslButtnOnOffCncl",
-    "CcAslButtnOnPress",
-    "CcAslButtnResDecPress",
-    "CcAslButtnResIncPress",
-    "CcAslButtnSetDecPress",
-    "CcAslButtnSetIncPress",
-    "CcAslButtnSetPress",
-    "CcButtnOffPress",
-    "CcButtnOnOffCnclPress",
-    "CcButtnOnOffPress",
-    "CcButtnOnPress",
-    "HeadLghtHiFlash_D_Actl",
-    "HeadLghtHiOn_B_StatAhb",
-    "AhbStat_B_Dsply",
-    "AccButtnGapTogglePress",
-    "WiprFrontSwtch_D_Stat",
-    "HeadLghtHiCtrl_D_RqAhb",
-  ]}
-
-  values.update({
-    "CcAslButtnCnclPress": 1 if cancel else 0,      # CC cancel button
-    "CcAsllButtnResPress": 1 if resume else 0,      # CC resume button
-    "TjaButtnOnOffPress": 1 if tja_toggle else 0,   # LCA/TJA toggle button
-  })
-  return packer.make_can_msg("Steering_Data_FD1", bus, values)
+    return CANParser(DBC[CP.carFingerprint]["pt"], messages, CanBus(CP).camera)
